@@ -1,0 +1,52 @@
+name: Post to Instagram
+
+on:
+  schedule:
+    # Times are in UTC. Pakistan is UTC+5, so these are 11:00, 17:00 and 21:00 PKT.
+    - cron: "0 6,12,16 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: write a caption but do NOT post (untick to post for real)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: instagram-poster
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Post the next image
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: python poster.py
+
+      - name: Save the posted list
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add posted.csv || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Update posted list"
+            git pull --rebase
+            git push
+          fi
