@@ -8,6 +8,7 @@ Optional environment variables:
     DRY_RUN=true      write the caption and print it, but do NOT post
     MAX_POSTS=1       how many images to post per run (default 1)
     GEMINI_MODEL=...  force a specific Gemini model name
+    ALLOW_FALLBACK=true  post with a generic caption if Gemini is down (default: skip the post)
 """
 import base64
 import csv
@@ -25,7 +26,13 @@ GEMINI = "https://generativelanguage.googleapis.com/v1beta/models"
 IMAGES_DIR = Path("images")
 POSTED_CSV = Path("posted.csv")
 IMAGE_EXTS = {".jpg", ".jpeg"}
-MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]
+MODEL_CANDIDATES = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
+]
 
 PROMPT = """You write Instagram captions for a men's hairstyle inspiration account.
 Look at the image and write ONE caption in English:
@@ -101,6 +108,56 @@ def clean_caption(text):
     return text.strip()[:2000]
 
 
+def discover_models(key):
+    """Ask Google which text+image models this key can use (names change over time)."""
+    try:
+        r = requests.get(GEMINI, headers={"x-goog-api-key": key},
+                         params={"pageSize": 200}, timeout=30)
+        items = r.json().get("models", []) if r.status_code == 200 else []
+    except (requests.RequestException, ValueError):
+        return []
+    skip = ("image", "live", "audio", "tts", "embedding", "native", "robotics", "computer")
+    names = []
+    for m in items:
+        name = m.get("name", "").split("/")[-1]
+        if ("generateContent" in m.get("supportedGenerationMethods", [])
+                and "flash" in name and not any(x in name for x in skip)):
+            names.append(name)
+    return sorted(names, reverse=True)
+
+
+def try_models(models, key, body):
+    for model in models:
+        for attempt in range(3):
+            try:
+                r = requests.post(f"{GEMINI}/{model}:generateContent",
+                                  headers={"x-goog-api-key": key}, json=body, timeout=90)
+            except requests.RequestException as e:
+                log(f"  Gemini request failed ({model}): {e}")
+                time.sleep(5)
+                continue
+            if r.status_code in (403, 404):
+                log(f"  model {model} not available to this key ({r.status_code}), trying the next one")
+                break
+            if r.status_code in (429, 500, 503):
+                log(f"  Gemini busy ({r.status_code}) on {model}, waiting...")
+                time.sleep(10 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                log(f"  Gemini error {r.status_code} on {model}: {r.text[:300]}")
+                break
+            try:
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts).strip()
+            except (KeyError, IndexError, ValueError):
+                log("  Gemini returned no caption (possibly blocked), trying again")
+                continue
+            if len(text) > 30:
+                log(f"  caption written by {model}")
+                return clean_caption(text)
+    return None
+
+
 def make_caption(path):
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
@@ -112,37 +169,18 @@ def make_caption(path):
             {"inline_data": {"mime_type": "image/jpeg", "data": data}},
             {"text": PROMPT},
         ]}],
-        "generationConfig": {"temperature": 0.8, "maxOutputTokens": 2000},
+        "generationConfig": {"temperature": 0.8, "maxOutputTokens": 4000},
     }
-    models = [os.environ["GEMINI_MODEL"]] if os.environ.get("GEMINI_MODEL") else MODEL_CANDIDATES
-    for model in models:
-        for attempt in range(3):
-            try:
-                r = requests.post(f"{GEMINI}/{model}:generateContent",
-                                  headers={"x-goog-api-key": key}, json=body, timeout=90)
-            except requests.RequestException as e:
-                log(f"  Gemini request failed ({model}): {e}")
-                time.sleep(5)
-                continue
-            if r.status_code == 404:
-                log(f"  model {model} not available, trying the next one")
-                break
-            if r.status_code in (429, 500, 503):
-                log(f"  Gemini busy ({r.status_code}), waiting...")
-                time.sleep(15 * (attempt + 1))
-                continue
-            if r.status_code != 200:
-                log(f"  Gemini error {r.status_code}: {r.text[:300]}")
-                break
-            try:
-                parts = r.json()["candidates"][0]["content"]["parts"]
-                text = "".join(p.get("text", "") for p in parts).strip()
-            except (KeyError, IndexError, ValueError):
-                log("  Gemini returned no caption (possibly blocked), trying again")
-                continue
-            if len(text) > 30:
-                log(f"  caption written by {model}")
-                return clean_caption(text)
+    first = [os.environ["GEMINI_MODEL"]] if os.environ.get("GEMINI_MODEL") else MODEL_CANDIDATES
+    caption = try_models(first, key, body)
+    if caption:
+        return caption
+    log("  none of the usual models worked, asking Google which models this key can use...")
+    found = [m for m in discover_models(key) if m not in first]
+    log(f"  models found: {', '.join(found) if found else 'none'}")
+    caption = try_models(found[:6], key, body)
+    if caption:
+        return caption
     log("  WARNING: could not get an AI caption, using the fallback caption")
     return FALLBACK_CAPTION
 
@@ -198,6 +236,10 @@ def main():
         if dry:
             log("Dry run: nothing was posted and nothing was recorded.")
             continue
+        if caption == FALLBACK_CAPTION and os.environ.get("ALLOW_FALLBACK", "false").lower() != "true":
+            sys.exit("No AI caption could be written, so nothing was posted (the image stays in the "
+                     "queue and the next scheduled run will try again). Set ALLOW_FALLBACK=true to post "
+                     "with the generic caption instead.")
         url = raw_url(path.name)
         if not wait_for_url(url):
             sys.exit(f"The public image link is not available yet: {url}")
