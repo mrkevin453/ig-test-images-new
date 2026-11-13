@@ -3,11 +3,15 @@ poster.py - posts the next unposted image from ./images to Instagram,
 with an AI-written caption. Runs inside GitHub Actions (see .github/workflows/post.yml).
 
 Secrets (set in GitHub, never in files):
-    IG_ACCESS_TOKEN, IG_USER_ID, GEMINI_API_KEY
+    IG_ACCESS_TOKEN, IG_USER_ID
+    and at least one caption AI: GEMINI_API_KEY and/or OPENROUTER_API_KEY
+Captions, in this order: captions.csv (columns: file,caption) if it has a row for the image;
+then Gemini; then a free vision model on OpenRouter.
 Optional environment variables:
     DRY_RUN=true      write the caption and print it, but do NOT post
     MAX_POSTS=1       how many images to post per run (default 1)
     GEMINI_MODEL=...  force a specific Gemini model name
+    OPENROUTER_MODEL=...  force a specific OpenRouter model (default: any free model that can see images)
     ALLOW_FALLBACK=true  post with a generic caption if Gemini is down (default: skip the post)
 """
 import base64
@@ -23,6 +27,7 @@ import requests
 
 GRAPH = "https://graph.facebook.com/v26.0"
 GEMINI = "https://generativelanguage.googleapis.com/v1beta/models"
+OPENROUTER = "https://openrouter.ai/api/v1"
 IMAGES_DIR = Path("images")
 POSTED_CSV = Path("posted.csv")
 IMAGE_EXTS = {".jpg", ".jpeg"}
@@ -99,6 +104,18 @@ def wait_for_url(url):
     return False
 
 
+def manual_caption(name):
+    """Use a hand-written caption from captions.csv (columns: file,caption) if there is one."""
+    p = Path("captions.csv")
+    if not p.exists():
+        return None
+    with open(p, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if (row.get("file") or "").strip() == name and (row.get("caption") or "").strip():
+                return clean_caption(row["caption"])
+    return None
+
+
 def clean_caption(text):
     text = text.strip().replace("**", "").replace("```", "")
     tags = [w for w in text.split() if w.startswith("#")]
@@ -106,6 +123,10 @@ def clean_caption(text):
         for extra in tags[30:]:
             text = text.replace(extra, "")
     return text.strip()[:2000]
+
+
+class GeminiDenied(Exception):
+    """Google refused the whole project (not just one model)."""
 
 
 def discover_models(key):
@@ -137,7 +158,10 @@ def try_models(models, key, body):
                 time.sleep(5)
                 continue
             if r.status_code in (403, 404):
-                log(f"  model {model} not available to this key ({r.status_code}), trying the next one")
+                snippet = " ".join(r.text.split())[:240]
+                log(f"  model {model} refused ({r.status_code}): {snippet}")
+                if r.status_code == 403 and "denied access" in r.text.lower():
+                    raise GeminiDenied(snippet)
                 break
             if r.status_code in (429, 500, 503):
                 log(f"  Gemini busy ({r.status_code}) on {model}, waiting...")
@@ -158,11 +182,7 @@ def try_models(models, key, body):
     return None
 
 
-def make_caption(path):
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        log("  no GEMINI_API_KEY, using fallback caption")
-        return FALLBACK_CAPTION
+def gemini_caption(path, key):
     data = base64.b64encode(path.read_bytes()).decode()
     body = {
         "contents": [{"parts": [
@@ -172,15 +192,93 @@ def make_caption(path):
         "generationConfig": {"temperature": 0.8, "maxOutputTokens": 4000},
     }
     first = [os.environ["GEMINI_MODEL"]] if os.environ.get("GEMINI_MODEL") else MODEL_CANDIDATES
-    caption = try_models(first, key, body)
-    if caption:
-        return caption
-    log("  none of the usual models worked, asking Google which models this key can use...")
-    found = [m for m in discover_models(key) if m not in first]
-    log(f"  models found: {', '.join(found) if found else 'none'}")
-    caption = try_models(found[:6], key, body)
-    if caption:
-        return caption
+    try:
+        caption = try_models(first, key, body)
+        if caption:
+            return caption
+        log("  none of the usual Gemini models worked, asking Google which models this key can use...")
+        found = [m for m in discover_models(key) if m not in first]
+        log(f"  Gemini models found: {', '.join(found) if found else 'none'}")
+        return try_models(found[:6], key, body)
+    except GeminiDenied:
+        log("  GOOGLE HAS DENIED THIS WHOLE PROJECT (not a model problem). "
+            "Check aistudio.google.com: billing tier 'Unavailable'/'Restricted'. "
+            "A new key from the same project will not fix it.")
+        return None
+
+
+def openrouter_free_vision_models(key):
+    """Ask OpenRouter which FREE models can read images (names change often)."""
+    try:
+        r = requests.get(f"{OPENROUTER}/models", headers={"Authorization": f"Bearer {key}"}, timeout=30)
+        items = r.json().get("data", []) if r.status_code == 200 else []
+    except (requests.RequestException, ValueError):
+        return []
+    models = []
+    for m in items:
+        mid = m.get("id", "")
+        modalities = (m.get("architecture") or {}).get("input_modalities") or []
+        if mid.endswith(":free") and "image" in modalities:
+            models.append(mid)
+    return models
+
+
+def openrouter_caption(path, key):
+    data = base64.b64encode(path.read_bytes()).decode()
+    chosen = os.environ.get("OPENROUTER_MODEL")
+    models = [chosen] if chosen else openrouter_free_vision_models(key)
+    log(f"  OpenRouter free vision models: {', '.join(models[:8]) if models else 'none found'}")
+    for model in models[:6]:
+        body = {
+            "model": model,
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}},
+            ]}],
+        }
+        for attempt in range(2):
+            try:
+                r = requests.post(f"{OPENROUTER}/chat/completions",
+                                  headers={"Authorization": f"Bearer {key}"}, json=body, timeout=120)
+            except requests.RequestException as e:
+                log(f"  OpenRouter request failed ({model}): {e}")
+                time.sleep(5)
+                continue
+            if r.status_code in (429, 500, 502, 503):
+                log(f"  OpenRouter busy ({r.status_code}) on {model}, waiting...")
+                time.sleep(10 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                log(f"  OpenRouter refused {model} ({r.status_code}): {' '.join(r.text.split())[:200]}")
+                break
+            try:
+                text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            except (KeyError, IndexError, ValueError, TypeError):
+                log(f"  OpenRouter gave no usable answer from {model}")
+                break
+            if len(text) > 30:
+                log(f"  caption written by {model} (OpenRouter)")
+                return clean_caption(text)
+            break
+    return None
+
+
+def make_caption(path):
+    gem_key = os.environ.get("GEMINI_API_KEY")
+    if gem_key:
+        caption = gemini_caption(path, gem_key)
+        if caption:
+            return caption
+    else:
+        log("  no GEMINI_API_KEY set, skipping Gemini")
+    or_key = os.environ.get("OPENROUTER_API_KEY")
+    if or_key:
+        caption = openrouter_caption(path, or_key)
+        if caption:
+            return caption
+    else:
+        log("  no OPENROUTER_API_KEY set, skipping OpenRouter")
     log("  WARNING: could not get an AI caption, using the fallback caption")
     return FALLBACK_CAPTION
 
@@ -231,7 +329,11 @@ def main():
 
     for path in todo:
         log(f"Image: {path.name}" + ("  (DRY RUN)" if dry else ""))
-        caption = make_caption(path)
+        caption = manual_caption(path.name)
+        if caption:
+            log("  caption taken from captions.csv")
+        else:
+            caption = make_caption(path)
         log("Caption:\n" + caption + "\n")
         if dry:
             log("Dry run: nothing was posted and nothing was recorded.")
