@@ -2,8 +2,8 @@ name: Post to Instagram
 
 on:
   schedule:
-    # Times are in UTC. Pakistan is UTC+5, so these are 11:00, 17:00 and 21:00 PKT.
-    - cron: "0 6,12,16 * * *"
+    # Times are in UTC. Pakistan is UTC+5, so these are 10:00, 13:00, 16:00, 19:00 and 22:00 PKT.
+    - cron: "0 5,8,11,14,17 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -36,6 +36,7 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: python poster.py
 
